@@ -204,3 +204,142 @@ jobs:
             Original PR: #${{ github.event.pull_request.number }}"
             ```
           pr-number: ${{ github.event.pull_request.number }}
+
+  check-spring-conversion:
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]' && github.base_ref == 'main'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Check if relevant files changed
+        id: check-files
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get list of changed files in the PR
+          CHANGED_FILES=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files --jq '.[].filename')
+          
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          
+          # Check if any relevant files were changed
+          if echo "$CHANGED_FILES" | grep -qE '^(scripts/spring-conversion\.sh|springboot3/|quarkus3-spring-compatibility/)'; then
+            echo "relevant_changes=true" >> $GITHUB_OUTPUT
+            echo "Relevant files were changed"
+          else
+            echo "relevant_changes=false" >> $GITHUB_OUTPUT
+            echo "No relevant files were changed"
+          fi
+
+      - name: Set up JDK 21
+        if: steps.check-files.outputs.relevant_changes == 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run spring-conversion.sh script
+        if: steps.check-files.outputs.relevant_changes == 'true'
+        id: run-conversion
+        run: |
+          ./scripts/spring-conversion.sh
+          
+          # ============================================================================
+          # TACTICAL: Ignore test file changes when checking for conversion differences
+          # The conversion script deletes tests, so we don't want to flag test-only
+          # changes as requiring a conversion update. This is a temporary workaround
+          # until we have better test conversion support.
+          # See: https://github.com/orgs/quarkusio/projects/60 (Spring Testing Working Group)
+          # ============================================================================
+          
+          # Reset any changes to test files
+          git checkout HEAD -- quarkus3-spring-compatibility/src/test/ 2>/dev/null || true
+          
+          # Check if there are changes (excluding test files)
+          if git diff --quiet quarkus3-spring-compatibility; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected in quarkus3-spring-compatibility directory (excluding tests)"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected in quarkus3-spring-compatibility directory (excluding tests)"
+          fi
+
+      - name: Create PR for conversion changes
+        if: steps.check-files.outputs.relevant_changes == 'true' && steps.run-conversion.outputs.has_changes == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name conversion-bot
+          git config user.email github-actions@github.com
+          
+          # Create branch name based on source PR
+          SOURCE_BRANCH="${{ github.head_ref }}"
+          CONVERSION_BRANCH="spring-conversion-${SOURCE_BRANCH}"
+          
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Conversion branch: $CONVERSION_BRANCH"
+          
+          # Delete local conversion branch if it exists
+          git branch -D $CONVERSION_BRANCH 2>/dev/null || true
+          
+          # Create conversion branch from current HEAD
+          git checkout -b $CONVERSION_BRANCH
+          
+          # Stage and commit the changes
+          git add quarkus3-spring-compatibility
+          git commit -m "Update quarkus3-spring-compatibility from spring-conversion.sh
+
+This update was triggered by PR #${{ github.event.pull_request.number }}"
+          
+          # Push the conversion branch
+          git push origin $CONVERSION_BRANCH --force
+          
+          # Create PR using GitHub CLI
+          PR_TITLE="[[Sync Spring -> Spring Compataibility] Update from PR #${{ github.event.pull_request.number }}"
+          PR_BODY="🤖 Automated update of \`quarkus3-spring-compatibility\` directory after running \`spring-conversion.sh\`.
+
+This PR contains changes detected after running the Spring to Quarkus conversion script, triggered by PR #${{ github.event.pull_request.number }}.
+
+**Source PR:** #${{ github.event.pull_request.number }}
+**Source Branch:** \`$SOURCE_BRANCH\`
+
+**Changes include:**
+- Updated files in \`quarkus3-spring-compatibility/\`
+
+Please review the changes to ensure they match the expected conversion output."
+          
+          # Check if PR already exists
+          EXISTING_PR=$(gh pr list --head $CONVERSION_BRANCH --base main --json number --jq '.[0].number' || echo "")
+          
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR already exists: #$EXISTING_PR"
+            gh pr edit $EXISTING_PR --body "$PR_BODY"
+          else
+            NEW_PR=$(gh pr create --base main --head $CONVERSION_BRANCH --title "$PR_TITLE" --body "$PR_BODY" --label "automated")
+            echo "Created new PR: $NEW_PR"
+          fi
+
+      - name: Update PR comment on conversion changes
+        if: steps.check-files.outputs.relevant_changes == 'true' && steps.run-conversion.outputs.has_changes == 'true'
+        uses: quarkusio/action-helpers@main
+        with:
+          action: maintain-one-comment
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            🤖 This PR causes changes to the `quarkus3-spring-compatibility` directory when the conversion script is run. A PR has been created with the updated conversion output. 🔄
+          pr-number: ${{ github.event.pull_request.number }}
+
+      - name: Update PR comment when no conversion changes
+        if: steps.check-files.outputs.relevant_changes == 'true' && steps.run-conversion.outputs.has_changes == 'false'
+        uses: quarkusio/action-helpers@main
+        with:
+          action: maintain-one-comment
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ✅ This PR does not cause changes to the `quarkus3-spring-compatibility` directory when the conversion script is run.
+          pr-number: ${{ github.event.pull_request.number }}
